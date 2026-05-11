@@ -151,7 +151,9 @@ console.log('isTop =', window.top === window.self);
     }
 
     function getConcurrency() {
-        return GM_getValue('scraper_concurrency', DEFAULT_CONCURRENCY);
+        const val = GM_getValue('scraper_concurrency', DEFAULT_CONCURRENCY);
+        const num = typeof val === 'number' ? val : parseInt(val, 10);
+        return (isNaN(num) || num < 1) ? DEFAULT_CONCURRENCY : num;
     }
 
     function getAutoCopy() {
@@ -1112,6 +1114,7 @@ console.log('isTop =', window.top === window.self);
         const itemList = Array.isArray(items) ? items : [items];
         const results = new Array(itemList.length);
         const CONCURRENCY = getConcurrency();
+        console.log(`[SmartScraper] 并发抓取启动: 共${itemList.length}个链接, 并发数=${CONCURRENCY}, 存储值=${GM_getValue('scraper_concurrency', '未设置')}`);
 
         const gmFetch = async (url) => {
             return new Promise((resolve, reject) => {
@@ -1139,7 +1142,7 @@ console.log('isTop =', window.top === window.self);
 
         /**
          * 检测HTML中的JS重定向和meta refresh重定向并提取目标URL
-         * 常见模式: 
+         * 常见模式:
          * 1. <script>document.location.href="...";</script>
          * 2. <script>window.location="...";</script>
          * 3. <meta http-equiv="refresh" content="0;URL=..." />
@@ -1156,7 +1159,8 @@ console.log('isTop =', window.top === window.self);
                         // content 格式: "0;URL=..." 或 "0; url=..." 或 "5;url=..."
                         const urlMatch = content.match(/url\s*=\s*(.+)/i);
                         if (urlMatch && urlMatch[1]) {
-                            return urlMatch[1].trim().replace(/^['"]|['"]$/g, '');
+                            const url = urlMatch[1].trim().replace(/^['"]|['"]$/g, '');
+                            if (isValidRedirectUrl(url)) return url;
                         }
                     }
                 }
@@ -1165,21 +1169,39 @@ console.log('isTop =', window.top === window.self);
             }
 
             // 2. 检测 JS 重定向
+            // 注意：使用负向前瞻 (?!\s*[+]) 排除字符串拼接的场景，
+            // 例如 window.location.href = '/wza/?wcaUrl=' + encodeURIComponent(...) 
+            // 这类代码并非真正的重定向，而是无障碍工具链接等
             const patterns = [
-                /document\.location\.href\s*=\s*['"]([^'"]+)['"]/i,
-                /document\.location\s*=\s*['"]([^'"]+)['"]/i,
-                /window\.location\.href\s*=\s*['"]([^'"]+)['"]/i,
-                /window\.location\s*=\s*['"]([^'"]+)['"]/i,
+                /document\.location\.href\s*=\s*['"]([^'"]+)['"](?!\s*[+])/i,
+                /document\.location\s*=\s*['"]([^'"]+)['"](?!\s*[+])/i,
+                /window\.location\.href\s*=\s*['"]([^'"]+)['"](?!\s*[+])/i,
+                /window\.location\s*=\s*['"]([^'"]+)['"](?!\s*[+])/i,
                 /location\.replace\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
                 /location\.assign\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
             ];
             for (const pattern of patterns) {
                 const match = html.match(pattern);
-                if (match && match[1]) {
+                if (match && match[1] && isValidRedirectUrl(match[1])) {
                     return match[1];
                 }
             }
             return null;
+        };
+
+        /**
+         * 验证检测到的重定向URL是否有效，过滤误判场景：
+         * - URL以 '=' 结尾（通常是字符串拼接被截断，如 '/wza/?wcaUrl=' + ...）
+         * - URL为空或仅包含空白字符
+         * - URL末尾查询参数值为空（如 ?key= ）
+         */
+        const isValidRedirectUrl = (url) => {
+            if (!url || !url.trim()) return false;
+            // URL 以 '=' 结尾说明是从字符串拼接中截取的片段，不是完整URL
+            if (url.endsWith('=')) return false;
+            // URL 末尾的查询参数值为空，如 /path?key= 也是拼接截断的典型特征
+            if (/[?&]\w+=\s*$/.test(url)) return false;
+            return true;
         };
 
         const fetchOne = async (item, index) => {
@@ -2448,9 +2470,25 @@ console.log('isTop =', window.top === window.self);
     // =====================================================================
     async function handleOcrMode(targetElement) {
         updateStatus('正在提取元素中的图片...');
-        const images = targetElement.querySelectorAll('img');
         const imageUrls = [];
 
+        // 如果选中的元素本身就是 <img>，直接将其作为图片处理
+        if (targetElement.tagName.toLowerCase() === 'img') {
+            const src = targetElement.src || targetElement.getAttribute('data-src') || targetElement.getAttribute('data-original');
+            if (src && !src.startsWith('data:')) {
+                imageUrls.push({ url: src, isBackground: false });
+            }
+        }
+
+        // 检查选中元素自身的背景图
+        const selfStyle = targetElement.getAttribute('style') || '';
+        const selfBgMatch = selfStyle.match(/url\(['"]?([^'")\s]+)['"]?\)/i);
+        if (selfBgMatch && selfBgMatch[1]) {
+            imageUrls.push({ url: selfBgMatch[1], isBackground: true });
+        }
+
+        // 查找后代元素中的图片和背景图
+        const images = targetElement.querySelectorAll('img');
         const allElements = targetElement.querySelectorAll('*');
         allElements.forEach(el => {
             const style = el.getAttribute('style') || '';
@@ -2607,9 +2645,9 @@ console.log('isTop =', window.top === window.self);
 
             GM_xmlhttpRequest({
                 method: "POST",
-                url: "https://xxxxxx-ai/api/chat",
+                url: "https://xxxxxxxxxx-ai/api/chat",
                 headers: {
-                  'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+                    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
                 },
                 data: JSON.stringify(jsonData),
                 timeout: 30000,
